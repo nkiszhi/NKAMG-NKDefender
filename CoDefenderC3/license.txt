@@ -1,0 +1,14 @@
+[
+    {
+        "product": "Binary Ninja",
+        "email": "519388073@qq.com",
+        "serial": "0fe0e1fe9acbc4670fa5f0905be71890",
+        "created": "2024-09-24T06:10:02.779619+00:00",
+        "type": "User",
+        "count": 1,
+        "data": "LxUOAmAFxXp21n6PWiveXKpfBWY1E3+0ylCH9vdNdKbKoz8m0lU5YMlzDMWuDHMQUCZta/oJQjYsSqThuu1q8C3BE2WCLzw+8EOIhWxg+KHyQ0VWW8hZfbt8iN5NS766xLwbZBpzjAcFvGrW1TiYYAb8TXIYdN9V1m0rzLc+eOfq1XvpNyYsB8nfNimHJmQlCJOX5LWd3tlODEjwiGH+wMTMCEHjQMnS1xgmrVIQCxRstOnFc7LKmNR6O0BBqdZYkDfFHObkz7lCTrgLdfmOVEpleFxcY+Hjx+OJEQHIHbuIJB8jINg3pmfYYE0dx9oHgCrzDW23dPQfAjPHhY6ouwYTWk8/bIIGlEmO88FAJeYMyedpz2mQog==",
+        "signature": "axGdwh6mVOWmiy/JgMmpxHyjfW6rlYFWHFPZs2mjya1Bf8HT2iLhtHCrPdq76a6odLPTVM+UkZ10174r+L52kIfoLPvt2BxGn/mOUagvwAN2/altChTrgQ14WBzS31XfqgoPjKSZ1f5m9M7Luw1OL7mlznGH4wkXLz97GE+JfkBJ2kAy93mujrDlBFqfGgoWYZohFzb1D8BW2F1id9LEFNNPosGciyYUXsZXGqzYOLY0WHoBOUZsVzU6wMZmVGlH/uiOqEFMjXiNKYsggiRAr1uw83dza6/Vlj/ui5tQGWzyFDc2vZgguCAD+5l7tLvGNtT42wDZ1pulFSwigq113w==",
+        "expiresEpoch": 1790230202,
+        "expires": "2026-09-24T06:10:02+00:00"
+    }
+]

@@ -1,0 +1,33 @@
+# CoDefenderC3 依赖
+# 必需
+numpy>=1.21
+scipy>=1.7
+scikit-learn>=1.0
+matplotlib>=3.5
+
+# 推荐
+lightgbm>=3.3          # EmberGBDT 模型
+
+# 可选 (Full 模式)
+# torch>=2.0           # 深度模型 (MalConv, LSTM, CNN, Transformer) — Docker 中从 PyTorch whl 安装
+# torchvision          # InceptionV3 / IMCFN — Docker 中从 PyTorch whl 安装
+# torch_geometric      # 图模型 (CFGGAT, GCN, DGCNN, MalGraph) — Docker 中单独安装
+# binaryninja           # PE 特征提取 (商业许可证) 
+
+# 可选 (EMBER 数据加载)
+# ember                 # pip install ember-dataset
+
+# API 服务层 (engine/app.py)
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
+
+# 可选 (壳检测)
+pefile>=2023.2.7
+
+# 可选 (fuzzy 模糊哈希预检: ssdeep; 缺失自动降级跳过 ssdeep 级)
+ppdeep>=20200505
+
+# 图模型工具链
+Pillow                 # IMCFN_2020 图像处理
+tqdm                   # MalGraph_2022 数据处理进度

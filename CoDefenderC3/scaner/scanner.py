@@ -1,0 +1,2026 @@
+"""
+NKAMG Scanner - 轻量级静态恶意软件扫描核心引擎
+仅实现两类静态检测: 哈希签名 (兼容 ClamAV .hdb 格式) + YARA 规则
+
+哈希签名存储采用 "Bloom shard 驱动的动态分片" 架构, 支持千万级签名库:
+  1. 分片数 N 完全由 config.json 的 bloom.shards 决定 (任意正整数, 如 16/64/256/1024):
+     路由规则 = int.from_bytes(digest[:4], 'big') % N, 不再依赖"哈希前 2 字符=固定 256 片"
+  2. Bloom 过滤器同样按 N 分片: 每个 SQLite 分片配一个独立位图
+     (签名库.bloom/{shard_id:04d}.bloom), 懒加载 + LRU 缓存, 冷启动零加载,
+     内存随查询按需增长
+  3. 查询: 路由到分片 → 该分片 Bloom 排除 → (候选时) 打开该分片 SQLite 只读点查;
+     并发模型: 查询路径无全局锁 (Bloom 查询期只读无锁 + SQLite 连接级串行锁,
+     不同分片并行); v3 起签名库仅存 SHA256, 查询单次点查即短路
+  4. 布局一致性: meta 表记录 layout 版本与 shard_count; 检测到旧 hex 前缀布局
+     (16/256/4096) 或修改 N 时启动自动重分片, 旧数据备份不丢失
+"""
+import hashlib
+import math
+import os
+import sqlite3
+import struct
+import threading
+import time
+from collections import OrderedDict
+
+import filetype as ft
+import staticinfo
+
+try:
+    import yara
+    YARA_AVAILABLE = True
+except ImportError:
+    YARA_AVAILABLE = False
+
+CHUNK_SIZE = 1024 * 1024  # 1MB 分块读取, 支持大文件
+
+VALID_HASH_LENGTHS = {32: "md5", 40: "sha1", 64: "sha256"}
+HASH_ALGO_BY_BYTES = {16: "MD5", 20: "SHA1", 32: "SHA256"}
+
+# 哈希算法规格表: HashSignatureDB 按 hash_algo 参数化 (md5/sha256 两个独立并列库)
+#   hex_len  = 十六进制长度, bytes = 摘要字节数, col = 主键列名, label = 显示名
+HASH_SPECS = {
+    "md5":    {"hex_len": 32, "bytes": 16, "col": "md5",    "label": "MD5"},
+    "sha1":   {"hex_len": 40, "bytes": 20, "col": "sha1",   "label": "SHA1"},
+    "sha256": {"hex_len": 64, "bytes": 32, "col": "sha256", "label": "SHA256"},
+}
+
+# sigs 表瘦身结构 (v4): 两列 (主键, size); v4.1 起支持纯主键单列 (去 size):
+#   v4:    <pk> BLOB PRIMARY KEY, size INTEGER   (md5 库现状)
+#   v4.1:  <pk> BLOB PRIMARY KEY                 (sha256 库: sha256 唯一确定内容,
+#          文件大小数学上冗余, 去掉 size 比对不改变任何真实检测结果)
+# 是否带 size 由已有分片表结构自动探测 (PRAGMA table_info), 亦可用构造参数
+# store_size 显式指定 (建新库时用)。
+# 检出名称不再入库、不再返回 (命中即视为已知恶意, 前端显示通用标签)。
+# 仅按显式列名 (主键[, size]) 操作, 与 name 完全解耦; 旧分片多余列由 SQLite 自动忽略。
+
+
+def compute_hashes(file_path):
+    """一次性分块计算文件的 MD5 / SHA256 (SHA1 跳过: 签名库仅存 SHA256+MD5)"""
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            md5.update(chunk)
+            sha256.update(chunk)
+    return md5.hexdigest(), None, sha256.hexdigest()
+
+
+def compute_hashes_bytes(data):
+    """从内存缓冲一次性计算 MD5 / SHA256 (SHA1 跳过: 签名库仅存 SHA256+MD5, 省 ~33% 哈希 CPU)"""
+    md5 = hashlib.md5(data).hexdigest()
+    sha256 = hashlib.sha256(data).hexdigest()
+    return md5, None, sha256
+
+
+def guess_file_type(file_path):
+    """通过魔数判断文件类型 (兼容旧接口, 返回显示名)
+
+    实际逻辑在 filetype.py 中实现, 移植自 ClamAV 的 FTM 魔数签名表:
+      固定偏移魔数 (type-0) → 模式搜索 (type-1: PE/SFX/HTML) → 尾部魔数 (DMG) → 文本编码检测
+    """
+    try:
+        head, tail = ft.read_head_tail(file_path)
+        return ft.detect_file_type(head, tail)["name"]
+    except OSError:
+        return "未知"
+
+
+# ============================================================
+# Bloom 过滤器 (纯 Python, 双哈希Double Hashing 实现)
+# ============================================================
+class BloomFilter:
+    """确定性 Bloom 过滤器: 宁可误报绝不漏报, 适配安全检测场景"""
+
+    MAGIC = b"NKB1"
+
+    def __init__(self, expected_items=1_000_000, fp_rate=0.01):
+        expected = max(1, expected_items)
+        self.m = math.ceil(-(expected * math.log(fp_rate)) / (math.log(2) ** 2))
+        self.k = max(1, min(16, round(self.m / expected * math.log(2))))
+        self.fp_rate = fp_rate
+        self.n = 0  # 已插入元素数
+        self.bits = bytearray((self.m + 7) // 8)
+
+    # (digest → positions) 实例级 LRU 缓存: 重复样本/重复请求命中高, 省掉 blake2b+求模
+    _POS_CACHE_MAX = 4096
+
+    def _positions(self, digest):
+        # blake2b 输出确定性双哈希 (跨进程/跨重启一致)
+        cache = self.__dict__.get("_pos_cache")
+        if cache is None:
+            cache = self._pos_cache = OrderedDict()
+        pos = cache.get(digest)
+        if pos is None:
+            h1, h2 = struct.unpack(
+                "<II", hashlib.blake2b(digest, digest_size=8).digest()
+            )
+            h2 |= 1
+            m = self.m
+            pos = tuple((h1 + i * h2) % m for i in range(self.k))
+            cache[digest] = pos
+            if len(cache) > self._POS_CACHE_MAX:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(digest)
+        return pos
+
+    def add(self, digest):
+        for p in self._positions(digest):
+            self.bits[p >> 3] |= 1 << (p & 7)
+        self.n += 1
+
+    def __contains__(self, digest):
+        bits = self.bits
+        for p in self._positions(digest):
+            if not (bits[p >> 3] >> (p & 7)) & 1:
+                return False
+        return True
+
+    @property
+    def mem_bytes(self):
+        return len(self.bits)
+
+    def save(self, path):
+        with open(path, "wb") as f:
+            f.write(self.MAGIC)
+            f.write(struct.pack("<QQd", self.m, self.k, self.fp_rate))
+            f.write(struct.pack("<Q", self.n))
+            f.write(bytes(self.bits))
+
+    @classmethod
+    def load(cls, path):
+        with open(path, "rb") as f:
+            if f.read(4) != cls.MAGIC:
+                raise ValueError("bloom 文件头无效")
+            m, k, fp = struct.unpack("<QQd", f.read(24))
+            n = struct.unpack("<Q", f.read(8))[0]
+            bits = bytearray(f.read())
+        bf = cls.__new__(cls)
+        bf.m, bf.k, bf.fp_rate, bf.n = m, k, fp, n
+        bf.bits = bits
+        return bf
+
+
+# ============================================================
+# 哈希签名库 (Bloom shard 驱动的动态分片 SQLite)
+# ============================================================
+class HashSignatureDB:
+    """千万级哈希签名库 (动态分片)
+
+    - 分片路由由 layout 参数决定:
+      modulo (默认): int.from_bytes(digest[:4], 'big') % N → 0000.db ~ (N-1).db
+      hex:           digest[0] → 00.db ~ ff.db (固定 256 片, 按 SHA256 前两字符直查)
+    - Bloom 按同样的分片数: {db_path}.bloom/{shard_id}.bloom, 与 SQLite 分片
+      一一对应, 懒加载 + LRU 缓存, 冷启动零加载, 内存随查询按需增长
+    - 查询: 路由 → 分片 Bloom 排除 (干净文件短路, 零 SQL) → 分片 SQLite 只读点查
+    - 布局: meta 记录 layout/shard_count; 布局或 N 变更时自动重分片, 旧数据备份到 .shards.legacy/
+    """
+
+    LAYOUT_MODULO = "modulo"
+    LAYOUT_HEX = "hex"
+    HEX_COUNTS = {1: 16, 2: 256, 3: 4096}  # hex 前缀长度 → 分片数 (旧布局)
+
+    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
+                 max_open_shards=4, hash_algo="sha256",
+                 ddl=None, insert_sql=None, row_cols=None,
+                 layout=LAYOUT_MODULO, store_size=None):
+        """hash_algo 决定主键列 (sha256/md5); ddl/insert_sql/row_cols 可覆盖默认表结构
+        (FuzzySignatureDB 用它定制 8 列模糊哈希结构; 默认 None = v4/v4.1 瘦身结构)
+
+        store_size: 库表是否含 size 列。None = 按已有分片表结构自动探测
+        (无分片时默认 True, 兼容 v4 建库); sha256 库迁到 v4.1 单列后自动为 False。
+
+        layout 决定分片路由与命名:
+          modulo: 摘要前4字节 % N → 4位十进制分片名 (0000~N-1), 任意 N 均匀分布
+          hex:    摘要首字节 → 2位十六进制分片名 (00~ff), 固定 256 片, 按 SHA256 前缀直查
+
+        v4 起库表为两列结构 (主键, size), 不存检出名称 (命中即视为已知恶意)。
+        """
+        if hash_algo not in HASH_SPECS:
+            raise ValueError(f"不支持的哈希算法: {hash_algo} (可选: {list(HASH_SPECS)})")
+        self.hash_algo = hash_algo
+        _spec = HASH_SPECS[hash_algo]
+        self.pk_col = _spec["col"]          # 主键列名 (md5 / sha256)
+        self.pk_hex_len = _spec["hex_len"]  # 主键十六进制长度 (32 / 64)
+        self.pk_bytes = _spec["bytes"]      # 主键摘要字节数 (16 / 32)
+        self.hash_label = _spec["label"]    # 显示名 (MD5 / SHA256)
+        self.layout = layout
+        if layout == self.LAYOUT_HEX:
+            self.shard_count = 256           # hex 布局固定 256 片 (2 字符前缀)
+        else:
+            self.shard_count = max(1, int(shard_count))
+        self.db_path = db_path
+        self.shard_dir = db_path + ".shards"
+        self.meta_path = os.path.join(self.shard_dir, "_meta.db")
+        self.bloom_dir = db_path + ".bloom"   # 分片 Bloom 位图目录
+        self.bloom_fp_rate = bloom_fp_rate
+        self.max_open_shards = max(4, max_open_shards)
+        # 表结构: v4 两列 (主键, size) / v4.1 纯主键单列 (sha256 库去 size);
+        # 亦可通过构造参数 ddl/insert_sql/row_cols 定制 (FuzzySignatureDB 8 列结构)。
+        # row_cols 供 _reshard 整行透传 SELECT 用, 须与 insert_sql 列数一致。
+        if store_size is None:
+            detected = self._detect_size_column()
+            self._store_size = True if detected is None else detected
+        else:
+            self._store_size = bool(store_size)
+        if ddl is not None:
+            self._ddl = ddl
+        elif self._store_size:
+            self._ddl = (
+                f"CREATE TABLE IF NOT EXISTS sigs({self.pk_col} BLOB PRIMARY KEY,"
+                " size INTEGER) WITHOUT ROWID"
+            )
+        else:
+            self._ddl = (
+                f"CREATE TABLE IF NOT EXISTS sigs({self.pk_col} BLOB PRIMARY KEY)"
+                " WITHOUT ROWID"
+            )
+        if insert_sql is not None:
+            self._insert_sql = insert_sql
+        elif self._store_size:
+            self._insert_sql = (
+                f"INSERT OR IGNORE INTO sigs({self.pk_col},size)"
+                " VALUES(?,?)"
+            )
+        else:
+            self._insert_sql = (
+                f"INSERT OR IGNORE INTO sigs({self.pk_col})"
+                " VALUES(?)"
+            )
+        if row_cols is not None:
+            self._row_cols = row_cols
+        else:
+            self._row_cols = (
+                f"{self.pk_col},size" if self._store_size else self.pk_col
+            )
+        self._lock = threading.RLock()       # 写路径互斥 (import_hdb / finalize / close)
+        self._cache_lock = threading.Lock()  # _conns/_blooms 字典 LRU 操作的细粒度锁
+        self._retired = []                   # LRU 淘汰的连接, 延迟到 close() 统一关闭
+        self.source_files = []
+
+        # 旧版单一 Bloom 文件 (sha256.db.bloom 单文件) 与新版 bloom 目录同名,
+        # 存在时先备份为 .bloom.legacy, 避免 makedirs 冲突
+        if os.path.isfile(db_path + ".bloom") and not os.path.isdir(self.bloom_dir):
+            try:
+                os.replace(db_path + ".bloom", db_path + ".bloom.legacy")
+            except OSError:
+                pass
+        os.makedirs(self.shard_dir, exist_ok=True)
+        os.makedirs(self.bloom_dir, exist_ok=True)
+        self.meta = self._open_rw(self.meta_path)
+        self._init_meta_schema(self.meta)
+
+        # 旧版单一 SQLite 库自动迁移 (一次性)
+        if os.path.exists(db_path):
+            self._migrate_legacy(db_path)
+
+        # 布局一致性: 旧 hex 前缀布局或 shard_count 变更 → 自动重分片
+        self._sync_layout()
+
+        self._conns = OrderedDict()    # shard_id(int) -> 只读 SQLite 连接 (LRU)
+        self._conn_locks = {}          # shard_id(int) -> 连接级串行锁 (Python sqlite3 不允许同连接并发 execute)
+        self._blooms = OrderedDict()   # shard_id(int) -> BloomFilter (LRU)
+        self._bloom_dirty = set()      # 需要重建 bloom 的分片
+        self._count = self._load_count()
+        self.source_files = [
+            r[0] for r in self.meta.execute("SELECT name FROM imported_files")
+        ]
+        self._scan_bloom()
+
+    # ---------- 行映射 (按 hash_algo) ----------
+    def _row_for_insert(self, digest, size):
+        """把 (digest,size) 映射为插入行 (v4.1 单列库丢弃 size)"""
+        if len(digest) != self.pk_bytes:
+            raise ValueError(
+                f"仅支持 {self.hash_label} 签名 ({self.pk_bytes}B), 收到 {len(digest)}B")
+        return (digest, size) if self._store_size else (digest,)
+
+    def _detect_size_column(self):
+        """探测已有分片 sigs 表是否含 size 列 (v4 两列) 或纯主键单列 (v4.1)
+
+        返回 True/False; 无分片/无法读取返回 None (调用方默认 True 兼容 v4 建库)。
+        """
+        if not os.path.isdir(self.shard_dir):
+            return None
+        for f in sorted(os.listdir(self.shard_dir)):
+            if not f.endswith(".db") or f == "_meta.db":
+                continue
+            try:
+                conn = sqlite3.connect(
+                    "file:%s?mode=ro" % os.path.join(self.shard_dir, f), uri=True)
+            except sqlite3.Error:
+                continue
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(sigs)")}
+            except sqlite3.Error:
+                cols = set()
+            finally:
+                conn.close()
+            if cols:
+                return "size" in cols
+        return None
+
+    # ---------- 路由与命名 ----------
+    def _route(self, digest, shard_count=None):
+        """路由: hex 布局取首字节 (0-255, 对应 00~ff 前缀); modulo 布局取前4字节对N取模"""
+        if self.layout == self.LAYOUT_HEX:
+            return digest[0]
+        n = shard_count or self.shard_count
+        return int.from_bytes(digest[:4], "big") % n
+
+    def _shard_id(self, digest):
+        return self._route(digest)
+
+    def _shard_name(self, shard_id):
+        if self.layout == self.LAYOUT_HEX:
+            return "%02x" % shard_id   # 2 位十六进制: 00 ~ ff
+        return "%04d" % shard_id       # 十进制 4 位定长: 0000 ~ N-1
+
+    def _shard_path(self, shard_id):
+        return os.path.join(self.shard_dir, self._shard_name(shard_id) + ".db")
+
+    def _bloom_path(self, shard_id):
+        return os.path.join(self.bloom_dir, self._shard_name(shard_id) + ".bloom")
+
+    # ---------- 分片布局检测与同步 ----------
+    def _layout_shard_files(self):
+        """当前目录下的分片文件名列表 (modulo: 4位十进制, hex: 2位十六进制; 排除 _meta.db)"""
+        result = []
+        for f in os.listdir(self.shard_dir):
+            if not f.endswith(".db") or f == "_meta.db":
+                continue
+            stem = f[:-3]
+            if len(stem) == 4 and stem.isdigit():
+                result.append(f)        # modulo 布局: 0000~9999
+            elif len(stem) == 2 and all(c in "0123456789abcdef" for c in stem):
+                result.append(f)        # hex 布局: 00~ff
+        return result
+
+    def _count_modulo_files(self):
+        return len(self._layout_shard_files())
+
+    def _detect_layout(self):
+        """扫描分片目录推断已有布局; 空目录返回 None → (layout, shard_count)"""
+        for f in os.listdir(self.shard_dir):
+            if f == "_meta.db" or not f.endswith(".db"):
+                continue
+            stem = f[:-3]
+            if stem == "resharding":
+                continue
+            if len(stem) == 4 and stem.isdigit():
+                return self.LAYOUT_MODULO, self._count_modulo_files()
+            if len(stem) in self.HEX_COUNTS and all(c in "0123456789abcdef" for c in stem):
+                return self.LAYOUT_HEX, self.HEX_COUNTS[len(stem)]
+        return None
+
+    def _sync_layout(self):
+        """确保分片布局与配置一致 (layout=modulo, shard_count=配置值); 不一致则重分片"""
+        row = self.meta.execute(
+            "SELECT v FROM meta WHERE k='layout'"
+        ).fetchone()
+        crow = self.meta.execute(
+            "SELECT v FROM meta WHERE k='shard_count'"
+        ).fetchone()
+        if row is None:
+            detected = self._detect_layout()
+            if detected is not None:
+                layout, old_count = detected
+            else:
+                layout, old_count = self.LAYOUT_MODULO, self.shard_count
+            with self.meta:
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('layout',?)", (layout,))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
+                    (str(old_count),))
+        else:
+            layout = row[0]
+            old_count = int(crow[0]) if crow else self.shard_count
+
+        if layout != self.layout or old_count != self.shard_count:
+            self._reshard(layout, old_count)
+
+    def _reshard(self, old_layout, old_count):
+        """把已有分片数据按当前路由规则重分布; 旧布局备份到 .shards.legacy/"""
+        t0 = time.time()
+        new_dir = self.shard_dir + ".resharding"
+        os.makedirs(new_dir, exist_ok=True)
+        total = 0
+        # 枚举旧分片文件 (不依赖命名规则, 兼容 hex/modulo 两种布局)
+        old_files = [
+            f for f in os.listdir(self.shard_dir)
+            if f.endswith(".db") and f != "_meta.db"
+        ]
+        for f in old_files:
+            src = os.path.join(self.shard_dir, f)
+            try:
+                src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            except sqlite3.Error:
+                continue
+            pending = {}
+            try:
+                cur = src_conn.execute(
+                    f"SELECT {self._row_cols} FROM sigs")
+                while True:
+                    rows = cur.fetchmany(50_000)
+                    if not rows:
+                        break
+                    for row in rows:  # 整行透传 (列数 = _row_cols, 与 _insert_sql 一致)
+                        sid = self._route(row[0], self.shard_count)
+                        pending.setdefault(sid, []).append(row)
+            except sqlite3.Error:
+                pass
+            src_conn.close()
+            for sid, rows in pending.items():
+                shard = self._open_rw(
+                    os.path.join(new_dir, self._shard_name(sid) + ".db"))
+                shard.execute(self._ddl)
+                shard.executemany(self._insert_sql, rows)
+                shard.commit()
+                shard.close()
+                total += len(rows)
+        # 旧分片移入备份目录, 新分片就位
+        backup_dir = self.shard_dir + ".legacy"
+        os.makedirs(backup_dir, exist_ok=True)
+        for f in old_files:
+            for name in (f, f + "-wal", f + "-shm", f + "-journal"):
+                try:
+                    os.replace(os.path.join(self.shard_dir, name),
+                               os.path.join(backup_dir, name))
+                except OSError:
+                    pass
+        for f in os.listdir(new_dir):
+            os.replace(os.path.join(new_dir, f), os.path.join(self.shard_dir, f))
+        try:
+            os.rmdir(new_dir)
+        except OSError:
+            pass
+        # 分片 Bloom 全部失效, 清理待重建 (旧单文件 bloom 已在上层备份)
+        for f in os.listdir(self.bloom_dir):
+            if f.endswith(".bloom"):
+                try:
+                    os.remove(os.path.join(self.bloom_dir, f))
+                except OSError:
+                    pass
+        with self.meta:
+            self.meta.execute("DELETE FROM shard_counts")
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','0')")
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('layout',?)",
+                (self.layout,))
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
+                (str(self.shard_count),))
+        print(f"[NKAMG] 分片重排: {old_layout}({old_count}) → "
+              f"{self.layout}({self.shard_count}), {total:,} 条, "
+              f"耗时 {time.time() - t0:.1f}s (旧布局备份: {backup_dir})")
+
+    # ---------- 连接管理 ----------
+    @staticmethod
+    def _open_rw(path):
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    @staticmethod
+    def _init_meta_schema(conn):
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS shard_counts(prefix TEXT PRIMARY KEY, cnt INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        conn.commit()
+
+    def _ro_conn(self, shard_id):
+        """获取分片只读连接 (懒加载 + LRU 淘汰); 分片文件不存在则返回 None
+
+        线程安全: 每个连接配一把串行锁 (_conn_locks) —— Python sqlite3 允许连接
+        跨线程使用 (check_same_thread=False), 但多个线程不能同时在同一连接上
+        execute; 连接级锁使同一连接串行、不同连接并行 (并发度 = min(分片数, LRU 上限))。
+        仅字典 LRU 操作处加细粒度 _cache_lock; 被淘汰的连接移入 _retired 延迟关闭,
+        避免正在查询中的连接被中途 close。
+        """
+        with self._cache_lock:
+            conn = self._conns.get(shard_id)
+            if conn is not None:
+                self._conns.move_to_end(shard_id)
+                return conn
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None  # 该分片无签名, 无需建库
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False
+            )
+            try:
+                conn.execute("PRAGMA query_only=ON")  # 双保险: 只读连接拒绝任何写
+            except sqlite3.Error:
+                pass
+            self._conns[shard_id] = conn
+            self._conn_locks[shard_id] = threading.Lock()
+            while len(self._conns) > self.max_open_shards:
+                old_id, old = self._conns.popitem(last=False)
+                self._conn_locks.pop(old_id, None)  # 淘汰分片的锁随之移除
+                self._retired.append(old)
+            return conn
+
+    def _query_shard(self, shard_id, sql, params=()):
+        """分片连接点查 (连接级串行锁; 连接被淘汰瞬间开临时连接补查, 不漏报)"""
+        conn = self._ro_conn(shard_id)
+        if conn is None:
+            return None
+        with self._cache_lock:
+            lock = self._conn_locks.get(shard_id)
+        if lock is None:
+            # 连接刚被 LRU 淘汰: 开临时只读连接补查, 确保不漏报 (C1 修复)
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            tmp_conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+            try:
+                return tmp_conn.execute(sql, params).fetchone()
+            finally:
+                tmp_conn.close()
+        with lock:
+            return conn.execute(sql, params).fetchone()
+
+    # ---------- 计数 ----------
+    def _load_count(self):
+        """优先读分片计数缓存; 缓存失效(未标记)时逐片重数"""
+        valid = self.meta.execute(
+            "SELECT v FROM meta WHERE k='counts_valid'"
+        ).fetchone()
+        if valid and valid[0] == "1":
+            row = self.meta.execute("SELECT SUM(cnt) FROM shard_counts").fetchone()
+            return row[0] or 0
+        total = 0
+        counts = []
+        for sid in range(self.shard_count):
+            path = self._shard_path(sid)
+            if not os.path.exists(path):
+                continue
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                cnt = conn.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+            except sqlite3.Error:
+                cnt = 0
+            conn.close()
+            counts.append((self._shard_name(sid), cnt))
+            total += cnt
+        with self.meta:
+            self.meta.executemany(
+                "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)", counts
+            )
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')"
+            )
+        return total
+
+    # ---------- 旧单库迁移 ----------
+    def _migrate_legacy(self, legacy_path):
+        """把旧版单一 sha256.db 的签名按当前路由规则拆入分片"""
+        try:
+            legacy = sqlite3.connect(legacy_path)  # rw 打开以恢复可能存在的 WAL
+            tables = {
+                r[0] for r in legacy.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "sigs" not in tables:
+                legacy.close()
+                os.replace(legacy_path, legacy_path + ".migrated")
+                return
+            t0 = time.time()
+            skipped = 0
+            pending = {}
+            cur = legacy.execute("SELECT h,size FROM sigs")  # 旧库为 v1 三列, name 丢弃
+            while True:
+                rows = cur.fetchmany(100_000)
+                if not rows:
+                    break
+                for h, size in rows:
+                    try:
+                        row9 = self._row_for_insert(h, size)  # 按本库主键映射
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    sid = self._route(h, self.shard_count)
+                    pending.setdefault(sid, []).append(row9)
+            # 迁移导入记录
+            try:
+                names = [r[0] for r in legacy.execute("SELECT name FROM imported_files")]
+            except sqlite3.Error:
+                names = []
+            legacy.close()
+            total = 0
+            count_updates = []
+            for sid, rows in pending.items():
+                shard = self._open_rw(self._shard_path(sid))
+                shard.execute(self._ddl)
+                before = shard.total_changes
+                for i in range(0, len(rows), 50_000):
+                    shard.executemany(self._insert_sql, rows[i:i + 50_000])
+                shard.commit()
+                inserted = shard.total_changes - before
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                shard.close()
+                total += inserted
+                count_updates.append((self._shard_name(sid), cnt))
+            with self.meta:
+                self.meta.executemany(
+                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)",
+                    [(n,) for n in names],
+                )
+                self.meta.executemany(
+                    "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                    count_updates,
+                )
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')"
+                )
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('migrated_from','1')"
+                )
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('layout',?)",
+                    (self.layout,))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
+                    (str(self.shard_count),))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version',?)",
+                    ("3" if self.hash_algo == "sha256" else "1",))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('primary_key',?)",
+                    (self.pk_col,))
+            os.replace(legacy_path, legacy_path + ".migrated")
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.remove(legacy_path + suffix)
+                except OSError:
+                    pass
+            skip_note = (f", 跳过非 {self.hash_label} {skipped:,} 条" if skipped else "")
+            print(f"[NKAMG] 旧单库已迁移至 {self.shard_count} 分片: {total:,} 条"
+                  f"{skip_note}, 耗时 {time.time() - t0:.1f}s (备份: {legacy_path}.migrated)")
+        except Exception as e:
+            print(f"[NKAMG] 旧库迁移失败(将按空分片库启动): {e}")
+
+    # ---------- Bloom (按分片懒加载) ----------
+    @staticmethod
+    def _bloom_stored_n(path):
+        """只读 bloom 文件头返回存储的元素数 n; 无效文件返回 None"""
+        try:
+            with open(path, "rb") as f:
+                if f.read(4) != BloomFilter.MAGIC:
+                    return None
+                f.read(24)  # m, k, fp
+                return struct.unpack("<Q", f.read(8))[0]
+        except OSError:
+            return None
+
+    def _scan_bloom(self):
+        """校验各分片 bloom 文件与签名数是否一致; 缺失/不一致 → 标记 dirty (finalize 重建)"""
+        try:
+            rows = self.meta.execute(
+                "SELECT prefix, cnt FROM shard_counts WHERE cnt > 0"
+            ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        for prefix, cnt in rows:
+            try:
+                if self.layout == self.LAYOUT_HEX:
+                    sid = int(prefix, 16)   # hex 前缀: "0a" → 10
+                else:
+                    sid = int(prefix)       # modulo 前缀: "0001" → 1
+            except ValueError:
+                continue
+            path = self._bloom_path(sid)
+            if self._bloom_stored_n(path) == cnt:
+                continue
+            self._bloom_dirty.add(sid)
+
+    def _load_bloom_shard(self, shard_id):
+        """懒加载某分片的 Bloom (LRU); 文件缺失或无效 → 返回 None (不排除, 保守)
+
+        查询期位图只读: 加载后调用方无锁读 bf.bits 是安全的 (引用替换/淘汰
+        都不原地修改位图); 此处仅对字典 LRU 操作加 _cache_lock。
+        """
+        with self._cache_lock:
+            bf = self._blooms.get(shard_id)
+            if bf is not None:
+                self._blooms.move_to_end(shard_id)
+                return bf
+            path = self._bloom_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            try:
+                bf = BloomFilter.load(path)
+            except Exception:
+                self._bloom_dirty.add(shard_id)
+                return None
+            self._blooms[shard_id] = bf
+            while len(self._blooms) > self.max_open_shards:
+                self._blooms.popitem(last=False)
+            return bf
+
+    def already_imported(self, filename):
+        with self._lock:
+            row = self.meta.execute(
+                "SELECT 1 FROM imported_files WHERE name=?", (filename,)
+            ).fetchone()
+            return row is not None
+
+    # ---------- 导入 ----------
+    def import_hdb(self, filepath, batch=50_000):
+        """导入 .hdb/.hsb 明文签名文件 (增量, 幂等), 返回新插入条数
+
+        仅接受与本库主键等长的哈希行 (sha256 库收 64hex, md5 库收 32hex),
+        其它合法长度 (32/40/64hex) 计数跳过。
+        """
+        basename = os.path.basename(filepath)
+        pending = {}  # shard_id -> [(digest, size)]
+        skipped = 0   # 非本库长度的合法哈希行
+        start = time.time()
+        with self._lock:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(":")
+                    if len(parts) < 3:
+                        continue
+                    h = parts[0].strip().lower()
+                    if len(h) == self.pk_hex_len:
+                        pass
+                    elif len(h) in VALID_HASH_LENGTHS:  # 其它长度 (md5/sha1/sha256): 计数跳过
+                        skipped += 1
+                        continue
+                    else:
+                        continue
+                    try:
+                        digest = bytes.fromhex(h)
+                    except ValueError:
+                        continue
+                    size_field = parts[1].strip()
+                    # "*" 和 "0" 均归一化为 None (不限大小): 否则 size=0 的签名在文件扫描时永远无法通过大小校验
+                    size = None if size_field in ("*", "0") else int(size_field)
+                    # 第 3 列检出名按 hdb 格式要求必须存在, 但 v4 起不再入库
+                    # 仅本库主键长度的签名入库, 按摘要前缀路由分片
+                    pending.setdefault(
+                        self._route(digest, self.shard_count), []
+                    ).append(self._row_for_insert(digest, size))
+            inserted = 0
+            count_updates = []
+            dirty = set()
+            for sid, rows in pending.items():
+                shard = self._open_rw(self._shard_path(sid))
+                shard.execute(self._ddl)
+                before = shard.total_changes
+                for i in range(0, len(rows), batch):
+                    shard.executemany(self._insert_sql, rows[i:i + batch])
+                shard.commit()
+                delta = shard.total_changes - before
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                shard.close()
+                inserted += delta
+                count_updates.append((self._shard_name(sid), cnt))
+                dirty.add(sid)
+            with self.meta:
+                self.meta.executemany(
+                    "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                    count_updates,
+                )
+                self.meta.execute(
+                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,)
+                )
+            self._count += inserted
+            self._bloom_dirty |= dirty  # 新增签名的分片 bloom 失效, 待 finalize 重建
+        if basename not in self.source_files:
+            self.source_files.append(basename)
+        if skipped:
+            print(f"[NKAMG] 导入 {basename}: 跳过 {skipped:,} 条非 {self.hash_label} 签名"
+                  f" (本库主键为 {self.hash_label})")
+        return inserted
+
+    # 旧接口兼容
+    def load_hdb(self, filepath):
+        return self.import_hdb(filepath)
+
+    def finalize(self):
+        """导入/迁移完成后调用: 重建标记为 dirty 的分片 Bloom (增量)。返回状态 dict"""
+        status = {}
+        with self._lock:
+            dirty = list(self._bloom_dirty)
+            if self._count > 0 and dirty:
+                t0 = time.time()
+                rebuilt = 0
+                for sid in dirty:
+                    if self.rebuild_bloom_shard(sid) is not None:
+                        rebuilt += 1
+                self._bloom_dirty.clear()
+                status["bloom_rebuilt"] = rebuilt
+                status["bloom_rebuilt_s"] = round(time.time() - t0, 1)
+        return status
+
+    # ---------- 单条写入 (管理接口: 增 / 删) ----------
+    def rebuild_bloom_shard(self, sid):
+        """重建单个分片的 Bloom 位图 (从该分片 SQLite 全量重算并落盘)。返回 bf 或 None。
+
+        用于: ① 新增哈希后该分片尚无 bloom 文件 (首条入库)；② finalize() 增量重建 dirty 分片。
+        已存在 bloom 的分片不会走到这里 (add_hash 直接复用并追加)。
+        """
+        path = self._shard_path(sid)
+        if not os.path.exists(path):
+            return None
+        conn = self._ro_conn(sid)
+        if conn is None:
+            return None
+        lock = self._conn_locks.get(sid)
+        if lock is None:
+            return None
+        with lock:
+            cnt = conn.execute(f"SELECT COUNT(*) FROM sigs").fetchone()[0]
+            if cnt == 0:
+                return None
+            bf = BloomFilter(cnt, self.bloom_fp_rate)
+            cur = conn.execute(f"SELECT {self.pk_col} FROM sigs")
+            while True:
+                rows = cur.fetchmany(100_000)
+                if not rows:
+                    break
+                for (h,) in rows:
+                    bf.add(h)
+        bf.save(self._bloom_path(sid))
+        with self._cache_lock:
+            self._blooms[sid] = bf
+        return bf
+
+    def add_hash(self, hash_hex, size):
+        """新增单条哈希签名 (hash:size), 自动按主键长度路由到 SHA256/MD5 库。
+
+        检出名称不入库 (命中即视为已知恶意, 前端显示通用标签)。
+        写入对应分片 SQLite + 更新计数 + 增量更新 Bloom (命中即被后续查询发现)。
+        返回新增条数 (0 表示已存在, 1 表示新增)。哈希长度须与本库主键等长
+        (sha256 库 64hex / md5 库 32hex), 否则抛 ValueError。
+        """
+        h = (hash_hex or "").strip().lower()
+        if len(h) != self.pk_hex_len:
+            raise ValueError(
+                f"需要 {self.pk_hex_len} 位 {self.hash_label} 十六进制, 收到 {len(h)} 位")
+        try:
+            digest = bytes.fromhex(h)
+        except ValueError:
+            raise ValueError("非法的十六进制哈希")
+        # "*", "" 和 0 均归一化为 None (不限大小), 与 import_hdb 行为一致
+        size_field = None if size in (None, "*", "", 0, "0") else int(size)
+        with self._lock:
+            sid = self._route(digest)
+            shard = self._open_rw(self._shard_path(sid))
+            shard.execute(self._ddl)
+            before = shard.total_changes
+            shard.execute(self._insert_sql, self._row_for_insert(digest, size_field))
+            inserted = shard.total_changes - before
+            shard.commit()
+            if inserted:
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                with self.meta:
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                        (self._shard_name(sid), cnt))
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+                self._count += inserted
+                # Bloom: 已有位图则追加并落盘; 否则首次全量重建 (含本条)
+                bf = self._load_bloom_shard(sid)
+                if bf is None:
+                    bf = self.rebuild_bloom_shard(sid)
+                if bf is not None:
+                    bf.add(digest)
+                    bf.save(self._bloom_path(sid))
+                    with self._cache_lock:
+                        self._blooms[sid] = bf
+            return inserted
+
+    def delete_hash(self, hash_hex):
+        """删除单条哈希签名, 返回删除条数 (0 表示不存在)。
+
+        仅从 SQLite 移除; Bloom 位图不回收该位 (布隆过滤器不可删除, 残留位只会造成
+        无害的假阳性 → SQLite 点查返回空 → 正确判定为未命中)。计数与分片计数同步更新。
+        """
+        h = (hash_hex or "").strip().lower()
+        if len(h) != self.pk_hex_len:
+            raise ValueError(
+                f"需要 {self.pk_hex_len} 位 {self.hash_label} 十六进制, 收到 {len(h)} 位")
+        try:
+            digest = bytes.fromhex(h)
+        except ValueError:
+            raise ValueError("非法的十六进制哈希")
+        with self._lock:
+            sid = self._route(digest)
+            if not os.path.exists(self._shard_path(sid)):
+                return 0
+            shard = self._open_rw(self._shard_path(sid))
+            before = shard.total_changes
+            shard.execute(f"DELETE FROM sigs WHERE {self.pk_col}=?", (digest,))
+            deleted = shard.total_changes - before
+            shard.commit()
+            if deleted:
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                with self.meta:
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                        (self._shard_name(sid), cnt))
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+                self._count -= deleted
+            return deleted
+
+    # ---------- 查询 ----------
+    @property
+    def count(self):
+        return self._count
+
+    def check_hash(self, hash_hex, file_size=None):
+        """按本库主键哈希十六进制查询 (md5 库收 32hex, sha256 库收 64hex)。
+
+        Bloom 排除短路 + 单分片 SQLite 点查; file_size=None 时跳过大小校验
+        (哈希查询场景调用方只有哈希没有文件)。返回命中列表, 结构与 check 一致。
+        """
+        hits = []
+        if not hash_hex or len(hash_hex) != self.pk_hex_len:
+            return hits
+        try:
+            digest = bytes.fromhex(hash_hex)
+        except ValueError:
+            return hits
+        shard_id = self._route(digest, self.shard_count)
+        bf = self._load_bloom_shard(shard_id)
+        if bf is not None and digest not in bf:
+            return hits
+        if self._store_size:
+            row = self._query_shard(
+                shard_id, f"SELECT size FROM sigs WHERE {self.pk_col}=?", (digest,)
+            )
+            if row is None:
+                return hits
+            sig_size = row[0]
+            if file_size is not None and sig_size is not None and sig_size != file_size:
+                return hits
+        else:
+            # v4.1 单列库: 纯存在性判定 (sha256 唯一确定内容, 无需大小校验)
+            if self._query_shard(
+                    shard_id, f"SELECT 1 FROM sigs WHERE {self.pk_col}=?",
+                    (digest,)) is None:
+                return hits
+            sig_size = None
+        hits.append({
+            "engine": "Hash DB",
+            "type": "hash",
+            "size": sig_size,
+            "detail": f"{self.hash_label} 命中: {hash_hex}",
+        })
+        return hits
+
+    def check(self, file_path, file_size, md5, sha1, sha256):
+        """检查文件哈希是否命中签名, 返回命中列表 (接口与旧版一致)
+
+        v3 起签名库仅存 SHA256 签名 (主键即 sha256), 查询只对 sha256 摘要做
+        一次 Bloom 排除 + SQLite 点查即短路; md5/sha1 参数保留仅为兼容接口,
+        库内无对应数据必然未命中。
+
+        并发安全 (P0 优化): 查询路径不再持全局锁 ——
+          · Bloom 位图查询期只读 (加载/淘汰只做引用替换, 不原地改位图) → 无锁读
+          · 分片连接 check_same_thread=False, SQLite serialized 模式可跨线程并发读
+          · 仅 _conns/_blooms 字典 LRU 操作在 _load_bloom_shard/_ro_conn 内部加细粒度锁
+        """
+        hits = []
+        if not sha256:
+            return hits
+        digest = bytes.fromhex(sha256)
+        shard_id = self._route(digest, self.shard_count)
+        # 第 1 层: 该分片 Bloom 排除 (干净文件短路, 零 SQL 开销)
+        bf = self._load_bloom_shard(shard_id)
+        if bf is not None and digest not in bf:
+            return hits
+        # 第 2 层: 该分片 SQLite 点查 (只加载路由匹配的那个分片)
+        if self._store_size:
+            row = self._query_shard(
+                shard_id, f"SELECT size FROM sigs WHERE {self.pk_col}=?", (digest,)
+            )
+            if row is None:
+                return hits
+            sig_size = row[0]
+            # 大小校验 (降低碰撞误报): 仅当调用方提供了 file_size 时比对;
+            # file_size=None (如 /api/hash/ 哈希查询, 调用方只有哈希没有文件) 跳过该校验
+            if file_size is not None and sig_size is not None and sig_size != file_size:
+                return hits
+        else:
+            # v4.1 单列库: 纯存在性判定 (sha256 唯一确定内容, 无需大小校验)
+            if self._query_shard(
+                    shard_id, f"SELECT 1 FROM sigs WHERE {self.pk_col}=?",
+                    (digest,)) is None:
+                return hits
+            sig_size = None
+        hits.append({
+            "engine": "Hash DB",
+            "type": "hash",
+            "size": sig_size,
+            "detail": f"SHA256 命中: {sha256}",
+        })
+        return hits
+
+    # ---------- 统计 ----------
+    def stats(self):
+        # 并发快照: 遍历 LRU 字典前先加锁, 避免迭代中被其它线程淘汰
+        with self._cache_lock:
+            bloom_items = list(self._blooms.values())
+            open_conns = len(self._conns)
+        bloom_info = None
+        if bloom_items:
+            total_mem = sum(b.mem_bytes for b in bloom_items)
+            bloom_info = {
+                "shards_configured": self.shard_count,
+                "shards_loaded": len(bloom_items),
+                "mem_mb": round(total_mem / 1048576, 2),
+                "hash_funcs": bloom_items[-1].k,
+                "fp_rate": self.bloom_fp_rate,
+            }
+        shard_files = self._layout_shard_files()
+        shard_sizes = []
+        for f in shard_files:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    shard_sizes.append(os.path.getsize(os.path.join(self.shard_dir, f + suffix)))
+                except OSError:
+                    pass
+        db_size = sum(shard_sizes)
+        try:
+            db_size += os.path.getsize(self.meta_path)
+        except OSError:
+            pass
+        tier = ("bloom-shards+sharded-sqlite"
+                if self._blooms else "sharded-sqlite")
+        return {
+            "count": self._count,
+            "tier": tier,
+            "bloom": bloom_info,
+            "shards": {
+                "configured": self.shard_count,
+                "total": len(shard_files),
+                "open_conns": open_conns,
+                "max_open": self.max_open_shards,
+            },
+            "db_size_mb": round(db_size / 1048576, 1),
+        }
+
+    def close(self):
+        with self._lock:
+            with self._cache_lock:
+                conns = list(self._conns.values()) + self._retired
+                self._conns.clear()
+                self._conn_locks.clear()
+                self._retired = []
+                self._blooms.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self.meta.close()
+
+
+# ============================================================
+# 模糊哈希签名库 (FuzzySignatureDB): 5 表独立结构
+# 每种 fuzzy hash 独立成表, 以 fuzzy hash 本身为主键 (不再是 sha256)
+# 数据源 ClamAV 8 字段 hdb 行: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
+# ============================================================
+FUZZY_TYPES = ["ssdeep", "vhash", "authentihash", "imphash", "rich_header_hash"]
+
+# 每种 fuzzy hash 的表定义: 表名 / 列名 / SQL 类型 / DDL / INSERT / SELECT 列
+FUZZY_TABLE_SPECS = {
+    "ssdeep": {
+        "col": "ssdeep", "sql_type": "TEXT", "label": "SSDeep",
+        "table": "sigs_ssdeep",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_ssdeep("
+               " ssdeep TEXT PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_ssdeep(ssdeep,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "ssdeep,size,name,sha256",
+    },
+    "vhash": {
+        "col": "vhash", "sql_type": "BLOB", "label": "VHash",
+        "table": "sigs_vhash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_vhash("
+               " vhash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_vhash(vhash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "vhash,size,name,sha256",
+    },
+    "authentihash": {
+        "col": "authentihash", "sql_type": "BLOB", "label": "Authentihash",
+        "table": "sigs_authentihash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_authentihash("
+               " authentihash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_authentihash(authentihash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "authentihash,size,name,sha256",
+    },
+    "imphash": {
+        "col": "imphash", "sql_type": "BLOB", "label": "Imphash",
+        "table": "sigs_imphash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_imphash("
+               " imphash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_imphash(imphash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "imphash,size,name,sha256",
+    },
+    "rich_header_hash": {
+        "col": "rich_header_hash", "sql_type": "BLOB", "label": "RichHeaderHash",
+        "table": "sigs_rich_header_hash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_rich_header_hash("
+               " rich_header_hash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_rich_header_hash(rich_header_hash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "rich_header_hash,size,name,sha256",
+    },
+}
+
+
+def _hex_to_blob(s):
+    """hex 字符串 → BLOB 字节 (偶数长度纯 hex); 空/非法/奇数长度返回 None"""
+    if not s:
+        return None
+    s = s.strip().lower()
+    if len(s) % 2 or not all(c in "0123456789abcdef" for c in s):
+        return None
+    return bytes.fromhex(s)
+
+
+class FuzzySignatureDB:
+    """5 表模糊哈希签名库 (每种 fuzzy hash 独立成表, 以 fuzzy hash 为主键)。
+
+    每个 hex 分片文件 (00.db ~ ff.db) 包含 5 张表:
+      sigs_ssdeep(ssdeep TEXT PK, size, name, sha256 BLOB)
+      sigs_vhash(vhash BLOB PK, size, name, sha256 BLOB)
+      sigs_authentihash(authentihash BLOB PK, size, name, sha256 BLOB)
+      sigs_imphash(imphash BLOB PK, size, name, sha256 BLOB)
+      sigs_rich_header_hash(rich_header_hash BLOB PK, size, name, sha256 BLOB)
+
+    路由: BLOB 类型取首字节, ssdeep 取 sha256(string) 首字节 → 00~ff 分片。
+    Bloom 按类型 × 分片: {shard}_{type}.bloom, 懒加载 + LRU 缓存。
+    数据源: ClamAV 8 字段 hdb 行, 每个非空 fuzzy 字段独立写入对应表。
+    """
+
+    LAYOUT_HEX = "hex"
+
+    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
+                 max_open_shards=16, layout="hex"):
+        self.db_path = db_path
+        self.shard_dir = db_path + ".shards"
+        self.bloom_dir = db_path + ".bloom"
+        self.meta_path = os.path.join(self.shard_dir, "_meta.db")
+        self.bloom_fp_rate = bloom_fp_rate
+        self.max_open_shards = max(4, max_open_shards)
+        self.layout = layout
+        self.shard_count = 256 if layout == self.LAYOUT_HEX else max(1, int(shard_count))
+
+        os.makedirs(self.shard_dir, exist_ok=True)
+        os.makedirs(self.bloom_dir, exist_ok=True)
+
+        self._lock = threading.RLock()
+        self._cache_lock = threading.Lock()
+
+        # Meta DB
+        self.meta = self._open_rw(self.meta_path)
+        self._init_meta()
+
+        # LRU caches: 连接按 shard_id 共享 (5 表在同一文件), bloom 按 (type, shard_id)
+        self._conns = OrderedDict()
+        self._conn_locks = {}
+        self._blooms = OrderedDict()    # (fuzzy_type, shard_id) -> BloomFilter
+        self._bloom_dirty = set()       # {(fuzzy_type, shard_id)}
+        self._retired = []
+
+        self._counts = self._load_counts()
+        self.source_files = [
+            r[0] for r in self.meta.execute("SELECT name FROM imported_files")
+        ]
+        self._scan_bloom()
+
+    # ---------- Meta ----------
+    @staticmethod
+    def _open_rw(path):
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_meta(self):
+        self.meta.execute(
+            "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)")
+        self.meta.execute(
+            "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        self.meta.execute(
+            "CREATE TABLE IF NOT EXISTS fuzzy_counts("
+            " type TEXT, prefix TEXT, cnt INTEGER NOT NULL,"
+            " PRIMARY KEY(type, prefix))")
+        self.meta.commit()
+        self.meta.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('layout','hex')")
+        self.meta.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('shard_count','256')")
+        self.meta.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version','4')")
+        self.meta.commit()
+
+    # ---------- 路由 ----------
+    def _route(self, fuzzy_type, value):
+        """Route fuzzy hash value → shard_id (0-255). ssdeep: sha256(str)[0]; BLOB: blob[0]"""
+        if fuzzy_type == "ssdeep":
+            return hashlib.sha256(value.encode("utf-8")).digest()[0]
+        return value[0]
+
+    def _bloom_key(self, fuzzy_type, value):
+        """Bloom 用的字节: ssdeep → sha256(str); BLOB → 原始字节"""
+        if fuzzy_type == "ssdeep":
+            return hashlib.sha256(value.encode("utf-8")).digest()
+        return value
+
+    def _shard_name(self, shard_id):
+        return "%02x" % shard_id
+
+    def _shard_path(self, shard_id):
+        return os.path.join(self.shard_dir, self._shard_name(shard_id) + ".db")
+
+    def _bloom_path(self, fuzzy_type, shard_id):
+        return os.path.join(self.bloom_dir,
+                            f"{self._shard_name(shard_id)}_{fuzzy_type}.bloom")
+
+    # ---------- 连接管理 (5 表共享同一 shard 连接) ----------
+    def _ro_conn(self, shard_id):
+        """获取分片只读连接 (懒加载 + LRU); 5 表共用同一连接"""
+        with self._cache_lock:
+            conn = self._conns.get(shard_id)
+            if conn is not None:
+                self._conns.move_to_end(shard_id)
+                return conn
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+            except sqlite3.Error:
+                pass
+            self._conns[shard_id] = conn
+            self._conn_locks[shard_id] = threading.Lock()
+            while len(self._conns) > self.max_open_shards:
+                old_id, old = self._conns.popitem(last=False)
+                self._conn_locks.pop(old_id, None)
+                self._retired.append(old)
+            return conn
+
+    def _query_shard(self, shard_id, sql, params=()):
+        conn = self._ro_conn(shard_id)
+        if conn is None:
+            return None
+        with self._cache_lock:
+            lock = self._conn_locks.get(shard_id)
+        if lock is None:
+            # 连接刚被 LRU 淘汰: 开临时只读连接补查, 确保不漏报 (C1 修复)
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            tmp_conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+            try:
+                return tmp_conn.execute(sql, params).fetchone()
+            finally:
+                tmp_conn.close()
+        with lock:
+            return conn.execute(sql, params).fetchone()
+
+    # ---------- 计数 ----------
+    def _load_counts(self):
+        """从 meta 的 fuzzy_counts 表加载各类型计数; 缓存失效则逐片重数"""
+        valid = self.meta.execute(
+            "SELECT v FROM meta WHERE k='counts_valid'").fetchone()
+        if valid and valid[0] == "1":
+            rows = self.meta.execute(
+                "SELECT type, SUM(cnt) FROM fuzzy_counts GROUP BY type").fetchall()
+            return {t: (c or 0) for t, c in rows}
+        counts = {t: 0 for t in FUZZY_TYPES}
+        count_rows = []
+        for sid in range(self.shard_count):
+            path = self._shard_path(sid)
+            if not os.path.exists(path):
+                continue
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            prefix = self._shard_name(sid)
+            for ftype in FUZZY_TYPES:
+                spec = FUZZY_TABLE_SPECS[ftype]
+                try:
+                    cnt = conn.execute(
+                        f"SELECT COUNT(*) FROM {spec['table']}").fetchone()[0]
+                except sqlite3.Error:
+                    cnt = 0
+                counts[ftype] += cnt
+                if cnt > 0:
+                    count_rows.append((ftype, prefix, cnt))
+            conn.close()
+        with self.meta:
+            self.meta.execute("DELETE FROM fuzzy_counts")
+            self.meta.executemany(
+                "INSERT OR REPLACE INTO fuzzy_counts(type,prefix,cnt) VALUES(?,?,?)",
+                count_rows)
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+        return counts
+
+    @property
+    def count(self):
+        return sum(self._counts.values())
+
+    def already_imported(self, filename):
+        with self._lock:
+            row = self.meta.execute(
+                "SELECT 1 FROM imported_files WHERE name=?", (filename,)).fetchone()
+            return row is not None
+
+    # ---------- Bloom ----------
+    @staticmethod
+    def _bloom_stored_n(path):
+        try:
+            with open(path, "rb") as f:
+                if f.read(4) != BloomFilter.MAGIC:
+                    return None
+                f.read(24)
+                return struct.unpack("<Q", f.read(8))[0]
+        except OSError:
+            return None
+
+    def _scan_bloom(self):
+        """校验各 (type, shard) bloom 与计数是否一致; 不一致标记 dirty"""
+        rows = self.meta.execute(
+            "SELECT type, prefix, cnt FROM fuzzy_counts WHERE cnt > 0").fetchall()
+        for ftype, prefix, cnt in rows:
+            try:
+                sid = int(prefix, 16)
+            except ValueError:
+                continue
+            path = self._bloom_path(ftype, sid)
+            if self._bloom_stored_n(path) != cnt:
+                self._bloom_dirty.add((ftype, sid))
+
+    def _load_bloom(self, fuzzy_type, shard_id):
+        """懒加载 (type, shard) 的 Bloom (LRU)"""
+        with self._cache_lock:
+            key = (fuzzy_type, shard_id)
+            bf = self._blooms.get(key)
+            if bf is not None:
+                self._blooms.move_to_end(key)
+                return bf
+            path = self._bloom_path(fuzzy_type, shard_id)
+            if not os.path.exists(path):
+                return None
+            try:
+                bf = BloomFilter.load(path)
+            except Exception:
+                self._bloom_dirty.add(key)
+                return None
+            self._blooms[key] = bf
+            while len(self._blooms) > self.max_open_shards:
+                self._blooms.popitem(last=False)
+            return bf
+
+    # ---------- 导入 ----------
+    def import_hdb(self, filepath, batch=50_000):
+        """导入 ClamAV 8 字段 hdb 文件, 每个非空 fuzzy 字段独立写入对应表。
+
+        行格式: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
+        每个 fuzzy hash 按自身值路由到 00~ff 分片, 写入对应表 (INSERT OR IGNORE 去重)。
+        """
+        basename = os.path.basename(filepath)
+        start = time.time()
+        with self._lock:
+            # pending: {(fuzzy_type, shard_id): [(hash_value, size, name, sha256_blob)]}
+            pending = {}
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(":")
+                    if len(parts) < 8:
+                        continue
+                    h = parts[0].strip().lower()
+                    if len(h) != 64:
+                        continue
+                    try:
+                        sha256_blob = bytes.fromhex(h)
+                    except ValueError:
+                        continue
+                    size_field = parts[1].strip()
+                    try:
+                        # "*" 和 "0" 均归一化为 None (不限大小), 与 HashSignatureDB.import_hdb 一致
+                        size = None if size_field in ("*", "0") else int(size_field)
+                    except ValueError:
+                        size = None
+                    name = parts[2].strip()
+                    ssdeep_val = parts[3].strip() or None
+                    vhash_blob = _hex_to_blob(parts[4])
+                    auth_blob = _hex_to_blob(parts[5])
+                    imp_blob = _hex_to_blob(parts[6])
+                    rich_blob = _hex_to_blob(parts[7])
+                    # 分发到 5 个表
+                    fuzzy_values = {
+                        "ssdeep": ssdeep_val,
+                        "vhash": vhash_blob,
+                        "authentihash": auth_blob,
+                        "imphash": imp_blob,
+                        "rich_header_hash": rich_blob,
+                    }
+                    for ftype, val in fuzzy_values.items():
+                        if val is None:
+                            continue
+                        sid = self._route(ftype, val)
+                        pending.setdefault((ftype, sid), []).append(
+                            (val, size, name, sha256_blob))
+            inserted = 0
+            count_updates = []
+            dirty = set()
+            for (ftype, sid), rows in pending.items():
+                spec = FUZZY_TABLE_SPECS[ftype]
+                shard = self._open_rw(self._shard_path(sid))
+                # 确保所有 5 张表都存在
+                for ft in FUZZY_TYPES:
+                    shard.execute(FUZZY_TABLE_SPECS[ft]["ddl"])
+                before = shard.total_changes
+                for i in range(0, len(rows), batch):
+                    shard.executemany(spec["insert"], rows[i:i + batch])
+                shard.commit()
+                delta = shard.total_changes - before
+                cnt = shard.execute(
+                    f"SELECT COUNT(*) FROM {spec['table']}").fetchone()[0]
+                shard.close()
+                inserted += delta
+                count_updates.append((ftype, self._shard_name(sid), cnt))
+                dirty.add((ftype, sid))
+            with self.meta:
+                self.meta.executemany(
+                    "INSERT OR REPLACE INTO fuzzy_counts(type,prefix,cnt) VALUES(?,?,?)",
+                    count_updates)
+                self.meta.execute(
+                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+            self._counts = self._load_counts()
+            self._bloom_dirty |= dirty
+        if basename not in self.source_files:
+            self.source_files.append(basename)
+        return inserted
+
+    # ---------- Finalize ----------
+    def finalize(self):
+        """导入完成后调用: 重建标记为 dirty 的 (type, shard) Bloom"""
+        status = {}
+        with self._lock:
+            dirty = list(self._bloom_dirty)
+            if dirty:
+                t0 = time.time()
+                rebuilt = 0
+                for ftype, sid in dirty:
+                    path = self._shard_path(sid)
+                    if not os.path.exists(path):
+                        continue
+                    conn = self._ro_conn(sid)
+                    if conn is None:
+                        continue
+                    lock = self._conn_locks.get(sid)
+                    if lock is None:
+                        continue
+                    spec = FUZZY_TABLE_SPECS[ftype]
+                    with lock:
+                        cnt = conn.execute(
+                            f"SELECT COUNT(*) FROM {spec['table']}").fetchone()[0]
+                        if cnt == 0:
+                            continue
+                        bf = BloomFilter(cnt, self.bloom_fp_rate)
+                        cur = conn.execute(
+                            f"SELECT {spec['col']} FROM {spec['table']}")
+                        while True:
+                            rows = cur.fetchmany(100_000)
+                            if not rows:
+                                break
+                            for (h,) in rows:
+                                bf.add(self._bloom_key(ftype, h))
+                    bf.save(self._bloom_path(ftype, sid))
+                    with self._cache_lock:
+                        self._blooms[(ftype, sid)] = bf
+                    rebuilt += 1
+                self._bloom_dirty.clear()
+                status["bloom_rebuilt"] = rebuilt
+                status["bloom_rebuilt_s"] = round(time.time() - t0, 1)
+        return status
+
+    # ---------- 查询 ----------
+    def check_fuzzy(self, fuzzy_type, hash_value, file_size=None):
+        """按 fuzzy hash 值查询对应表。hash_value: ssdeep 传 str, BLOB 类型传 bytes。"""
+        hits = []
+        if fuzzy_type not in FUZZY_TABLE_SPECS:
+            return hits
+        spec = FUZZY_TABLE_SPECS[fuzzy_type]
+        sid = self._route(fuzzy_type, hash_value)
+        bf = self._load_bloom(fuzzy_type, sid)
+        bloom_key = self._bloom_key(fuzzy_type, hash_value)
+        if bf is not None and bloom_key not in bf:
+            return hits
+        row = self._query_shard(
+            sid,
+            f"SELECT size, name, sha256 FROM {spec['table']} WHERE {spec['col']}=?",
+            (hash_value,))
+        if row is None:
+            return hits
+        sig_size, name, sha256_blob = row
+        if file_size is not None and sig_size is not None and sig_size != file_size:
+            return hits
+        sha256_hex = sha256_blob.hex() if sha256_blob else None
+        hits.append({
+            "engine": "Fuzzy Hash DB",
+            "type": "fuzzy",
+            "name": name,
+            "size": sig_size,
+            "detail": f"{spec['label']} 命中",
+            "fuzzy_type": fuzzy_type,
+            "sha256": sha256_hex,
+        })
+        return hits
+
+    def check_by_computed_hashes(self, ssdeep=None, imphash_hex=None,
+                                  authentihash_hex=None, file_size=None):
+        """批量查询: 用 staticinfo 计算出的 fuzzy hash 查各表, 返回命中列表"""
+        hits = []
+        if ssdeep:
+            hits.extend(self.check_fuzzy("ssdeep", ssdeep, file_size))
+        if imphash_hex:
+            try:
+                hits.extend(self.check_fuzzy("imphash", bytes.fromhex(imphash_hex), file_size))
+            except ValueError:
+                pass
+        if authentihash_hex:
+            try:
+                hits.extend(self.check_fuzzy("authentihash", bytes.fromhex(authentihash_hex), file_size))
+            except ValueError:
+                pass
+        return hits
+
+    # ---------- 统计 ----------
+    def stats(self):
+        with self._cache_lock:
+            bloom_items = list(self._blooms.values())
+            open_conns = len(self._conns)
+        bloom_info = None
+        if bloom_items:
+            total_mem = sum(b.mem_bytes for b in bloom_items)
+            bloom_info = {
+                "shards_configured": self.shard_count,
+                "types": len(FUZZY_TYPES),
+                "loaded": len(bloom_items),
+                "mem_mb": round(total_mem / 1048576, 2),
+                "fp_rate": self.bloom_fp_rate,
+            }
+        shard_files = [
+            f for f in os.listdir(self.shard_dir)
+            if f.endswith(".db") and f != "_meta.db"
+            and len(f) == 5 and all(c in "0123456789abcdef" for c in f[:2])
+        ]
+        db_size = 0
+        for f in shard_files:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    db_size += os.path.getsize(os.path.join(self.shard_dir, f + suffix))
+                except OSError:
+                    pass
+        try:
+            db_size += os.path.getsize(self.meta_path)
+        except OSError:
+            pass
+        return {
+            "count": self.count,
+            "counts_by_type": dict(self._counts),
+            "tier": "fuzzy-5table-sharded-sqlite" if self._blooms else "sharded-sqlite",
+            "bloom": bloom_info,
+            "shards": {
+                "configured": self.shard_count,
+                "total": len(shard_files),
+                "types": len(FUZZY_TYPES),
+                "open_conns": open_conns,
+                "max_open": self.max_open_shards,
+            },
+            "db_size_mb": round(db_size / 1048576, 1),
+        }
+
+    def close(self):
+        with self._lock:
+            with self._cache_lock:
+                conns = list(self._conns.values()) + self._retired
+                self._conns.clear()
+                self._conn_locks.clear()
+                self._retired = []
+                self._blooms.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self.meta.close()
+
+
+# ============================================================
+# YARA 扫描器 (合并编译 + 单次匹配)
+# ============================================================
+class YaraScanner:
+    """YARA 规则扫描器 (合并编译优化)
+
+    启动时收集全部 .yar 文件路径, 首次匹配前用 yara.compile(filepaths=...)
+    合并为**单一 Rules 对象** (每文件独立 namespace, 规则名冲突互不干扰),
+    匹配时只需一次 .match() 调用, 避免 1433+ 次串行编译/匹配的初始化开销。
+
+    旧实现逐文件编译为独立 Rules 对象, 匹配时 for r in rulesets 串行调用,
+    每次重复支付 YARA 初始化开销; 合并后从 N 次降为 1 次。
+    """
+
+    def __init__(self):
+        self._pending = {}           # {filename: filepath} 待批量编译
+        self._compiled = None        # 合并编译的单一 Rules 对象
+        self._compile_lock = threading.Lock()
+        self.rule_count = 0          # 累计规则条数
+        self.source_files = []       # 成功加载的文件名列表
+        self.errors = []             # [(文件名, 错误), ...] 编译失败的文件
+        self.error = None if YARA_AVAILABLE else "yara-python 未安装, YARA 引擎不可用"
+
+    @property
+    def rules(self):
+        """触发延迟编译, 返回合并后的单一 Rules 对象 (无则 None)"""
+        self._ensure_compiled()
+        return self._compiled
+
+    @property
+    def rulesets(self):
+        """向后兼容: 返回 [compiled] 或 []"""
+        self._ensure_compiled()
+        return [self._compiled] if self._compiled else []
+
+    def load_rules(self, filepath):
+        """收集 .yar/.yara 文件路径, 标记需重新编译 (实际编译延迟到首次匹配)
+
+        不再逐文件预编译 (旧实现); 批量编译在 _ensure_compiled 中一次性完成,
+        坏文件在批量编译失败后逐个排查。
+        """
+        if not YARA_AVAILABLE:
+            return 0
+        fname = os.path.basename(filepath)
+        with self._compile_lock:
+            self._pending[fname] = filepath
+            self._compiled = None  # 标记需重新编译
+        count = self._count_rules(filepath)
+        self.rule_count += count
+        if fname not in self.source_files:
+            self.source_files.append(fname)
+        return count
+
+    def warmup(self):
+        """启动时预编译全部规则 (避免首次扫描延迟)"""
+        self._ensure_compiled()
+
+    def _ensure_compiled(self):
+        """延迟批量编译: 用 yara.compile(filepaths=...) 合并全部规则为单一 Rules"""
+        if self._compiled is not None or not self._pending:
+            return
+        with self._compile_lock:
+            if self._compiled is not None:  # double-check
+                return
+            pending_copy = dict(self._pending)
+            # 尝试一次性合并编译 (每文件独立 namespace, 规则名冲突互不干扰)
+            try:
+                self._compiled = yara.compile(filepaths=pending_copy)
+                self.errors = []
+                return
+            except yara.Error:
+                pass
+            # 合并编译失败: 逐文件编译找出坏文件, 好文件批量重编译
+            good = {}
+            new_errors = []
+            for fname, fpath in pending_copy.items():
+                try:
+                    yara.compile(filepath=fpath)
+                    good[fname] = fpath
+                except yara.Error as e:
+                    new_errors.append((fname, str(e)))
+                except (MemoryError, OSError) as e:
+                    new_errors.append((fname, f"编译资源不足: {e}"))
+            self.errors = new_errors
+            if good:
+                try:
+                    self._compiled = yara.compile(filepaths=good)
+                except yara.Error as e:
+                    self.error = f"YARA 批量编译失败: {e}"
+
+    @staticmethod
+    def _count_rules(filepath):
+        """统计规则文件中的 rule 数量"""
+        count = 0
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("rule ") or stripped == "rule":
+                    count += 1
+        return count
+
+    def scan(self, file_path):
+        """扫描文件, 返回命中列表 (路径版本: YARA 自行读盘)"""
+        self._ensure_compiled()
+        if not self._compiled:
+            return []
+        try:
+            matches = self._compiled.match(file_path, timeout=30)
+        except yara.TimeoutError:
+            return self._timeout_hit()
+        except yara.Error:
+            return []
+        return self._format_matches(matches)
+
+    def scan_data(self, data):
+        """扫描内存缓冲, 返回命中列表 (单次 .match 调用, 复用调用方已读入的数据)"""
+        self._ensure_compiled()
+        if not self._compiled:
+            return []
+        try:
+            matches = self._compiled.match(data=data, timeout=30)
+        except yara.TimeoutError:
+            return self._timeout_hit()
+        except yara.Error:
+            return []
+        return self._format_matches(matches)
+
+    @staticmethod
+    def _timeout_hit():
+        return [{
+            "engine": "YARA",
+            "type": "error",
+            "name": "YaraScanTimeout",
+            "detail": "规则匹配超时 (30s)",
+        }]
+
+    @staticmethod
+    def _error_hit(e):
+        return [{
+            "engine": "YARA",
+            "type": "error",
+            "name": "YaraScanError",
+            "detail": str(e),
+        }]
+
+    @staticmethod
+    def _format_matches(matches):
+        hits = []
+        for m in matches:
+            strings = []
+            for s in m.strings:
+                # yara-python 4.x: s 是 StringMatch 对象
+                identifier = getattr(s, "identifier", None) or str(s)
+                strings.append(str(identifier))
+            hits.append({
+                "engine": "YARA",
+                "type": "yara",
+                "name": m.rule,
+                "detail": ("匹配串: " + ", ".join(strings[:5])) if strings else "规则命中",
+                "meta": {k: str(v) for k, v in (m.meta or {}).items()},
+            })
+        return hits
+
+
+# ============================================================
+# 统一扫描器
+# ============================================================
+class Scanner:
+    """统一扫描器: 哈希签名 + YARA"""
+
+    # 一次性读入内存的上限: 超过则退回分块+路径扫描, 防大文件占满内存
+    INLINE_LIMIT = 64 * 1024 * 1024
+
+    def __init__(self, hash_db, yara_scanner, md5_db=None, fuzzy_db=None):
+        self.hash_db = hash_db
+        self.yara_scanner = yara_scanner
+        self.md5_db = md5_db  # 独立 MD5 分片库 (可选); 命中并入 detections
+        self.fuzzy_db = fuzzy_db  # 模糊哈希库 (可选); phase2 用计算的 fuzzy hash 按值查 5 张表
+
+    def scan_file(self, file_path, filename=None):
+        """扫描单个文件 (兼容接口)。
+
+        <=64MB 一次性读入内存, 哈希 / 类型识别 / YARA 从同一份缓冲取 (文件只读一遍);
+        更大文件退回 _scan_large 分块路径。
+        """
+        file_size = os.path.getsize(file_path)
+        if file_size <= self.INLINE_LIMIT:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            return self._scan_common(
+                data, filename or os.path.basename(file_path), file_size
+            )
+        return self._scan_large(file_path, filename)
+
+    def scan_bytes(self, data, filename=None):
+        """直接扫描内存数据 (Web 上传路径: 全程不落盘, 零额外磁盘 IO)"""
+        return self._scan_common(data, filename or "unnamed", len(data))
+
+    def scan_phase1(self, data, filename=None, hashes=None):
+        """两段式扫描·阶段1 (Web 上传): 哈希 + 文件类型 + 哈希签名库命中, 毫秒级立即返回
+
+        hashes: 可选 (md5, sha1, sha256) 预计算哈希元组, 传入则不再重算 (P0-2)。
+        """
+        return self._phase1(data, filename or "unnamed", hashes=hashes)
+
+    def scan_phase2(self, data, filename=None):
+        """两段式扫描·阶段2 (Web 上传, 后台线程): YARA 规则 + 静态信息/模糊哈希 + 查壳"""
+        return self._phase2(data, filename or "unnamed")
+
+    def merge_phases(self, p1, p2):
+        """两段式扫描·合并: 阶段1 + 阶段2 → 完整扫描结果 (供轮询接口拼装)"""
+        return self._merge_phases(p1, p2)
+
+    def _scan_common(self, data, filename, file_size):
+        """内存复用核心 (同步完整扫描): 哈希 → 类型识别 → 签名库 → YARA → 静态信息
+
+        供 scan_file / scan_bytes 兼容使用, 等价于 _phase1 + _phase2 顺序合并;
+        Web 上传路径改用 scanner.scan_phase1 / scan_phase2 两段式 (哈希先返回, 深度分析动态更新)。
+        """
+        p1 = self._phase1(data, filename)
+        p2 = self._phase2(data, filename)
+        return self._merge_phases(p1, p2)
+
+    def _phase1(self, data, filename, hashes=None):
+        """阶段 1 (快速, 同步返回): 哈希 → 文件类型 → 哈希签名库命中
+
+        只做 O(1) 哈希计算 + Bloom/SQLite 点查, 毫秒级返回;
+        hashes 参数可传入预计算的 (md5, sha1, sha256) 避免重算 (P0-2);
+        返回结构带 phase="hash" 标记, detections 仅含 Hash DB 命中。
+        """
+        start = time.time()
+        if hashes:
+            md5, sha1, sha256 = hashes
+        else:
+            md5, sha1, sha256 = compute_hashes_bytes(data)
+        file_size = len(data)
+
+        # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)
+        ftype = {"name": "未知", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "n/a"}
+        try:
+            head = data[:ft.MAGIC_BUFFER_SIZE]
+            tail = (data[-512:] if len(data) > ft.MAGIC_BUFFER_SIZE + 512 else b"")
+            ftype = ft.detect_file_type(head, tail, filename)
+        except Exception:
+            pass
+
+        detections = list(self.hash_db.check(None, file_size, md5, sha1, sha256))
+        if self.md5_db is not None:
+            detections.extend(self.md5_db.check_hash(md5, file_size))
+        # 模糊哈希查询移至 phase2: 需先计算 ssdeep/imphash/authentihash 才能按值查询
+        elapsed_ms = round((time.time() - start) * 1000, 1)
+        return {
+            "filename": filename or "unnamed",
+            "size": file_size,
+            "size_human": _human_size(file_size),
+            "file_type": ftype["name"],          # 显示名 (向后兼容)
+            "file_type_info": ftype,             # 结构化: name/cl_type/category/method
+            "md5": md5,
+            "sha1": sha1,
+            "sha256": sha256,
+            "detections": detections,            # 仅 Hash DB 命中
+            "clean": len(detections) == 0,
+            "verdict": "CLEAN" if not detections else "DETECTED",
+            "scanners": ["Hash DB (md5/sha1/sha256)"],
+            "elapsed_ms": elapsed_ms,            # 阶段1耗时
+            "static_info": None,
+            "static_ms": 0.0,
+            "phase": "hash",
+        }
+
+    def _phase2(self, data, filename):
+        """阶段 2 (深度, 后台执行): YARA 规则匹配 + 静态信息/模糊哈希 + 查壳
+
+        返回合并阶段 1 所需的补充字段: detections(YARA + Fuzzy Hash) / static_info / static_ms / elapsed_ms / scanners。
+        """
+        start = time.time()
+        detections = list(self.yara_scanner.scan_data(data))
+
+        # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测)
+        static_start = time.time()
+        static_info = staticinfo.compute_static_info(data)
+        static_ms = round((time.time() - static_start) * 1000, 1)
+
+        # 模糊哈希签名库查询: 用 staticinfo 计算出的 ssdeep/imphash/authentihash 查各表
+        if self.fuzzy_db is not None:
+            fuzzy_info = static_info.get("fuzzy", {}) if static_info else {}
+            fuzzy_hits = self.fuzzy_db.check_by_computed_hashes(
+                ssdeep=fuzzy_info.get("ssdeep"),
+                imphash_hex=fuzzy_info.get("imphash"),
+                authentihash_hex=fuzzy_info.get("authentihash"),
+                file_size=len(data),
+            )
+            detections.extend(fuzzy_hits)
+
+        elapsed_ms = round((time.time() - start) * 1000, 1)
+        scanners = (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else [])
+        if self.fuzzy_db is not None:
+            scanners.append("Fuzzy Hash DB")
+        return {
+            "detections": detections,            # YARA + Fuzzy Hash 命中
+            "static_info": static_info,
+            "static_ms": static_ms,
+            "elapsed_ms": elapsed_ms,            # 阶段2耗时
+            "scanners": scanners,
+        }
+
+    def _merge_phases(self, p1, p2):
+        """合并阶段 1/2 结果 → 完整扫描结果 (返回结构与原 _scan_common 一致)"""
+        detections = p1["detections"] + p2["detections"]
+        return {
+            "filename": p1["filename"],
+            "size": p1["size"],
+            "size_human": p1["size_human"],
+            "file_type": p1["file_type"],        # 显示名 (向后兼容)
+            "file_type_info": p1["file_type_info"],
+            "md5": p1["md5"],
+            "sha1": p1["sha1"],
+            "sha256": p1["sha256"],
+            "static_info": p2["static_info"],     # fuzzy: ssdeep/tlsh/imphash/authentihash; pe: PE 元数据; packer: 壳检测
+            "static_ms": p2["static_ms"],
+            "clean": len(detections) == 0,
+            "verdict": "CLEAN" if not detections else "DETECTED",
+            "detections": detections,
+            "elapsed_ms": round(p1["elapsed_ms"] + p2["elapsed_ms"], 1),
+            "scanners": p1["scanners"] + p2["scanners"],
+            "phase": "done",
+        }
+
+    def _scan_large(self, file_path, filename=None):
+        """大文件退回路径: 分块哈希 + 头尾类型识别 + YARA 路径扫描 (与旧版一致)"""
+        start = time.time()
+        file_size = os.path.getsize(file_path)
+        md5, sha1, sha256 = compute_hashes(file_path)
+
+        # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)
+        ftype = {"name": "未知", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "n/a"}
+        try:
+            head, tail = ft.read_head_tail(file_path)
+            ftype = ft.detect_file_type(head, tail, filename)
+        except OSError:
+            pass
+
+        detections = []
+        detections.extend(self.hash_db.check(file_path, file_size, md5, sha1, sha256))
+        if self.md5_db is not None:
+            detections.extend(self.md5_db.check_hash(md5, file_size))
+        detections.extend(self.yara_scanner.scan(file_path))
+
+        # 大文件路径: 不计算模糊哈希/静态信息 (避免超大文件纯 Python 计算失控)
+        static_info = None
+        static_ms = 0.0
+
+        elapsed_ms = round((time.time() - start) * 1000, 1)
+        return {
+            "filename": filename or os.path.basename(file_path),
+            "size": file_size,
+            "size_human": _human_size(file_size),
+            "file_type": ftype["name"],          # 显示名 (向后兼容)
+            "file_type_info": ftype,             # 结构化: name/cl_type/category/method
+            "md5": md5,
+            "sha1": sha1,
+            "sha256": sha256,
+            "static_info": static_info,          # 大文件路径不计算
+            "static_ms": static_ms,
+            "clean": len(detections) == 0,
+            "verdict": "CLEAN" if not detections else "DETECTED",
+            "detections": detections,
+            "elapsed_ms": elapsed_ms,
+            "scanners": ["Hash DB (md5/sha1/sha256)"]
+                         + (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else []),
+        }
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024

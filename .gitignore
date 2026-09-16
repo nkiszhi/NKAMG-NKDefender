@@ -11,3 +11,9 @@ dist/
 .env
 .env.*
 !.env.example
+
+# CoDefenderC3 derived artifacts / large files
+CoDefenderC3/.feature_cache/
+CoDefenderC3/_tools/ember.zip
+CoDefenderC3/*.pyc
+CoDefenderC3/**/__pycache__/
